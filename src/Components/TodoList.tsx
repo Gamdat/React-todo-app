@@ -1,338 +1,244 @@
-import { useQueryClient, useMutation, useQuery } from "@tanstack/react-query";
-import { createTodo, deleteTodo, fetchTodos, updateTodo } from "../api/todos";
-import type { Todo } from "../types";
-import { useEffect, useMemo } from "react";
-import TodoItem from "./TodoItem";
-import TodoForm from "./TodoForm";
-import Pagination from "./Pagination";
-import { useLikes } from "../hooks/useLikes";
+import { useState, ChangeEvent } from "react";
+import {useQuery, useMutation, useQueryClient,} from "@tanstack/react-query";
+import { Link } from "react-router-dom";
+import { toast } from "react-toastify";
 
-
-
-const LIMIT = 10;
-
-
-
-interface Props {
-  page: number;
-  onPageChange: (p: number) => void;
-
+// Define Todo type
+interface Todo {
+  userId: number;
+  id: number;
+  title: string;
+  completed: boolean;
 }
 
-
-
-export default function TodoList({ page, onPageChange }: Props) {
-  const queryClient = useQueryClient();
-  const { isLiked, toggleLike, likedSet } = useLikes();
-
-
-
-  // Fetch paginated todos
-
-  const { data, isLoading, isError, error } = useQuery({
-    queryKey: ["todos", page, LIMIT],
-    queryFn: () => fetchTodos(page, LIMIT),
-    staleTime: 30_000,
-    keepPreviousData: true,
-
-  });
-
-
-
-  // Merge likes client-side
-
-  const todos = useMemo<Todo[] | undefined>(() => {
-    if (!data) return undefined;
-    return data.data.map(t => ({ ...t, liked: isLiked(t.id) }));
-  }, [data, isLiked]);
-
-
-
-  // Create
-
-  const addMutation = useMutation({
-    mutationFn: (title: string) => createTodo({ title }),
-    onSuccess: (created) => {
-
-      // Optimistically put the new item into page 1 cache
-
-      queryClient.setQueryData(["todos", 1, LIMIT], (old: any) => {
-
-        if (!old) return old;
-
-        return {
-
-          ...old,
-
-          data: [{ ...created, id: created.id ?? Date.now() }, ...old.data].slice(0, LIMIT),
-
-          total: old.total + 1,
-
-        };
-
-      });
-
-      // Also refresh current page if needed
-
-      queryClient.invalidateQueries({ queryKey: ["todos"] });
-
-    },
-
-  });
-
-
-
-  // Update (rename or toggle complete)
-
-  const updateMutation = useMutation({
-
-    mutationFn: ({ id, patch }: { id: number; patch: Partial<Todo> }) =>
-
-      updateTodo(id, patch),
-
-    onMutate: async ({ id, patch }) => {
-
-      const keys = queryClient.getQueryCache().findAll({ queryKey: ["todos"] }).map(q => q.queryKey);
-
-      const snapshots = keys.map(key => {
-
-        const prev = queryClient.getQueryData<any>(key);
-
-        if (prev) {
-
-          const next = {
-
-            ...prev,
-
-            data: prev.data.map((t: Todo) => (t.id === id ? { ...t, ...patch } : t)),
-
-          };
-
-          queryClient.setQueryData(key, next);
-
-        }
-
-        return { key, prev };
-
-      });
-
-      return { snapshots };
-
-    },
-
-    onError: (_err, _vars, ctx) => {
-
-      ctx?.snapshots?.forEach((s: any) => queryClient.setQueryData(s.key, s.prev));
-
-    },
-onSuccess: () => {
-
-  alert(" Todo updated successfully!");
-
-  queryClient.invalidateQueries({ queryKey: ["todos"] });
-
-},
-    onSettled: () => {
-
-      queryClient.invalidateQueries({ queryKey: ["todos"] });
-
-    },
-
-  });
-
-
-
-  // Delete
-
-  const deleteMutation = useMutation({
-
-    mutationFn: (id: number) => deleteTodo(id),
-
-    onMutate: async (id) => {
-
-      const keys = queryClient.getQueryCache().findAll({ queryKey: ["todos"] }).map(q => q.queryKey);
-
-      const snapshots = keys.map(key => {
-
-        const prev = queryClient.getQueryData<any>(key);
-
-        if (prev) {
-
-          const next = {
-
-            ...prev,
-
-            data: prev.data.filter((t: Todo) => t.id !== id),
-
-            total: Math.max(0, prev.total - 1),
-
-          };
-
-          queryClient.setQueryData(key, next);
-
-        }
-
-        return { key, prev };
-
-      });
-
-      return { snapshots };
-
-    },
-
-    onError: (_err, _id, ctx) => {
-
-      ctx?.snapshots?.forEach((s: any) => queryClient.setQueryData(s.key, s.prev));
-
-    },
-onSuccess: () => {
-
-  alert(" Todo deleted successfully!");
-
-  queryClient.invalidateQueries({ queryKey: ["todos"] });
-
-},
-
-
-    onSettled: () => {
-
-      queryClient.invalidateQueries({ queryKey: ["todos"] });
-
-    },
-
-  });
-
-
-
-  // Keep likes in sync visually when user toggles like on the current page
-
-  function handleToggleLike(id: number) {
-
-    toggleLike(id);
-
-    // reflect in visible cache without refetch
-
-    const keys = queryClient.getQueryCache().findAll({ queryKey: ["todos"] }).map(q => q.queryKey);
-
-    keys.forEach(key => {
-
-      const prev = queryClient.getQueryData<any>(key);
-
-      if (prev) {
-
-        queryClient.setQueryData(key, {
-
-          ...prev,
-
-          data: prev.data.map((t: Todo) =>
-
-            t.id === id ? { ...t, liked: !t.liked } : t
-
-          ),
-
-        });
-
-      }
-
-    });
-
+// Fetch all todos
+async function fetchTodos(): Promise<Todo[]> {
+  const res = await fetch("https://jsonplaceholder.typicode.com/todos");
+  if (!res.ok) {
+    throw new Error("Failed to fetch todos");
   }
+  return res.json();
+}
+
+function TodoList() {
+  const [currentPage, setCurrentPage] = useState<number>(1);
+  const todosPerPage = 10;
+
+  const [searchTerm, setSearchTerm] = useState<string>("");
+  const [filterStatus, setFilterStatus] = useState<"all" | "completed" | "incomplete">("all");
+
+  const queryClient = useQueryClient();
+
+  // Query to fetch todos
+  const {
+    data: todos,
+    isLoading,
+    isError,
+    error,
+  } = useQuery<Todo[], Error>({
+    queryKey: ["todos"],
+    queryFn: fetchTodos,
+  });
+
+  // Delete Todo
+  const deleteTodoMutation = useMutation<void, Error, number>({
+    mutationFn: async (id) => {
+      const res = await fetch(`https://jsonplaceholder.typicode.com/todos/${id}`, {
+        method: "DELETE",
+      });
+      if (!res.ok) {
+        throw new Error("Failed to delete todo");
+      }
+    },
+
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["todos"] });
+      toast.success("Todo Deleted Successfully");
+    },
+  });
 
 
 
-  useEffect(() => {
+  // Update Todo
 
-    // When likedSet changes (e.g., from another tab), reflect it in current data
+  const updateMutation = useMutation<void, Error, { id: number; updated: Todo }>({
+    mutationFn: async ({ id, updated }) => {
+      const res = await fetch(`https://jsonplaceholder.typicode.com/todos/${id}`, {
+        method: "PUT",
+        body: JSON.stringify(updated),
+        headers: {
+          "Content-Type": "application/json",
+        },
 
-    const keys = queryClient.getQueryCache().findAll({ queryKey: ["todos"] }).map(q => q.queryKey);
+      });
 
-    keys.forEach(key => {
-
-      const prev = queryClient.getQueryData<any>(key);
-
-      if (prev) {
-
-        queryClient.setQueryData(key, {
-
-          ...prev,
-
-          data: prev.data.map((t: Todo) => ({ ...t, liked: likedSet.has(t.id) })),
-
-        });
-
+      if (!res.ok) {
+        throw new Error("Failed to update todo");
       }
 
-    });
+    },
 
-  }, [likedSet, queryClient]);
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["todos"] });
+      toast.success("Todo Updated Successfully");
+    },
 
-
-
-  if (isLoading) return <p className="muted">Loading…</p>;
-
-  if (isError) throw error as Error;
-
+  });
 
 
-  const total = data?.total ?? 0;
+
+  // Handle search
+
+  const handleSearchChange = (e: ChangeEvent<HTMLInputElement>) => {
+    setSearchTerm(e.target.value.toLowerCase());
+  };
 
 
+
+  // Handle filter
+  const handleFilterChange = (status: "all" | "completed" | "incomplete") => {
+    setFilterStatus(status);
+    setCurrentPage(1);
+  };
+
+
+
+  // Combine filters
+
+  const filteredTodos = todos?.filter((todo) => {
+    const matchesSearch = todo.title.toLowerCase().includes(searchTerm);
+    const matchesStatus =
+      filterStatus === "all" ||
+      (filterStatus === "completed" && todo.completed) ||
+      (filterStatus === "incomplete" && !todo.completed);
+    return matchesSearch && matchesStatus;
+  }) ?? [];
+
+
+
+  // Pagination
+
+  const indexOfLastTodo = currentPage * todosPerPage;
+  const indexOfFirstTodo = indexOfLastTodo - todosPerPage;
+  const currentTodos = filteredTodos.slice(indexOfFirstTodo, indexOfLastTodo);
+
+  if (isLoading) return <p>Loading todos...</p>;
+  if (isError) return <p>Error: {error.message}</p>;
 
   return (
+    <main>
+      <header>
+        <h1 className="Header">All Todos</h1>
+      </header>
 
-    <div className="panel">
-
-      <TodoForm onAdd={(title) => addMutation.mutate(title)} />
 
 
+      {/* Search Box */}
 
+      <button className="search">
+        <input
+          type="text"
+          placeholder="Search by title"
+          value={searchTerm}
+          onChange={handleSearchChange}
+        />
+      </button>
+
+
+
+      {/* Filter Buttons */}
+      <div className="filterbtn">
+        <button className="allbtn" onClick={() => handleFilterChange("all")}>
+          All
+        </button>
+        <button className="completebtn" onClick={() => handleFilterChange("completed")}>
+          Completed
+        </button>
+        <button className="incompletebtn" onClick={() => handleFilterChange("incomplete")}>
+          Incomplete
+        </button>
+      </div>
+
+
+      {/* Todo List */}
       <ul className="todo-list">
+        {filteredTodos.length === 0 ? (
+          <p>No matching todos found</p>
+        ) : (
+          currentTodos.map((todo) => (
+            <li key={todo.id}>
+              <div className="link">
+                <h3>{todo.title}</h3>
+                <Link to={`/todo/${todo.id}`}>View Details</Link>
+              </div>
 
-        {todos?.map((todo) => (
 
-          <TodoItem
+              {/* Buttons */}
+              <div className="buttons">
+                {/* Delete */}
+                <button
+                  onClick={() => {
+                    const confirmDelete = window.confirm("Are you sure you want to delete this todo?");
+                    if (confirmDelete) {
+                    deleteTodoMutation.mutate(todo.id);
+                    }
+                  }}
+                  className="delete"
+                >
+                  Delete
+                </button>
 
-            key={todo.id}
 
-            todo={todo}
 
-            onToggleComplete={(id, completed) =>
-
-              updateMutation.mutate({ id, patch: { completed } })
-
-            }
-
-            onDelete={(id) => deleteMutation.mutate(id)}
-
-            onRename={(id, title) => updateMutation.mutate({ id, patch: { title } })}
-
-            onToggleLike={handleToggleLike}
-
-          />
-
-        ))}
-
+                {/* Update */}
+                <button
+                  className="Edit"
+                  onClick={() =>
+                    updateMutation.mutate({
+                      id: todo.id,
+                      updated: {
+                        userId: todo.userId,
+                        id: todo.id,
+                        title: todo.title + " (Updated)",
+                        completed: todo.completed,
+                      },
+                    })
+                  }
+                >
+                  Edit Todo
+                </button>
+              </div>
+            </li>
+          ))
+        )}
       </ul>
 
+      {/* Pagination Controls */}
+      <div className="pagination-control">
+        <button
+          className="prev"
+          onClick={() => setCurrentPage((prev) => Math.max(prev - 1, 1))}
+          disabled={currentPage === 1}
+        >
+          Prev
+        </button>
 
+        <span className="page">Page {currentPage}</span>
 
-      <Pagination
-
-        page={page}
-
-        limit={LIMIT}
-
-        total={total}
-
-        onPageChange={onPageChange}
-
-      />
-
-    </div>
-
+        <button
+          className="next"
+          onClick={() => {
+            const totalPages = Math.ceil(filteredTodos.length / todosPerPage);
+            setCurrentPage((prev) => Math.min(prev + 1, totalPages));
+          }}
+          disabled={indexOfLastTodo >= filteredTodos.length}
+        >
+          Next
+        </button>
+      </div>
+    </main>
   );
-
 }
 
-
+export default TodoList;
 
